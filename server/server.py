@@ -14,6 +14,8 @@ LOCK_TIME = timedelta(minutes=5)
 # Diccionario en memoria para controlar bloqueos: {username: {"attempts": int, "locked_until": datetime}}
 locked_users = {}
 failed_attempts = {}
+active_sessions = {}
+locked_nonces = set()  # Para evitar reutilización de nonces
 
 # Clave secreta para HMAC (en un sistema real debería venir de una variable de entorno)
 HMAC_SECRET_KEY = b'secret_key_for_hmac'  # Cambia esto por una clave segura en producción
@@ -129,3 +131,86 @@ def verify_user(username, password):
             cursor.close()
         if con:
             con.close()
+
+
+def handle_server(client_socket):
+    try:
+        client_socket.sendall("Seleccione una opción:\n".encode())
+        client_socket.sendall("1. Registrarse\n".encode())
+        client_socket.sendall("2. Verificar credenciales\n".encode())
+        client_socket.sendall("3. Cerrar conexión\n".encode())
+        client_socket.sendall("Iniciar Transacción: ".encode())
+        option = client_socket.recv(1024).decode().strip()
+
+        
+        if option == "1":
+            client_socket.sendall("Ingrese nombre de usuario: ".encode())
+            username = client_socket.recv(1024).decode().strip()
+            client_socket.sendall("Ingrese contraseña: ".encode())
+            password = client_socket.recv(1024).decode().strip()
+            password_hash = hash_password(password)
+
+            if register_user(username, password_hash):
+                client_socket.sendall("Usuario registrado exitosamente\n".encode())
+            else:
+                client_socket.sendall("Error: El nombre de usuario ya existe\n".encode())
+        
+        if option == "2":
+            client_socket.sendall("Ingrese nombre de usuario: ".encode())
+            username = client_socket.recv(1024).decode().strip()
+            client_socket.sendall("Ingrese contraseña: ".encode())
+            password = client_socket.recv(1024).decode().strip()
+            password_hash = hash_password(password)
+
+            result = verify_user(username, password)
+            if result == "Acceso concedido":
+                active_sessions[username] = client_socket
+
+                nonce = generate_nonce()
+                locked_nonces.add(nonce)
+
+                hmac = generate_hmac(result,nonce)
+                client_socket.sendall(f'{result}\nNonce: {nonce}\nHMAC: {hmac}\n'.encode())
+ 
+        if option == "4":
+            client_socket.sendall("Ingrese nombre de usuario: ".encode())
+            username = client_socket.recv(1024).decode().strip()
+
+            if username not in active_sessions:
+                client_socket.sendall("Introduzca la transacción:\n".encode())
+                transaction = client_socket.recv(1024).decode().strip()
+
+                nonce = generate_nonce()
+                locked_nonces.add(nonce)
+
+                hmac = generate_hmac(transaction, nonce)
+                client_socket.sendall(f'Transacción finalizada\nNonce: {nonce}\nHMAC: {hmac}\n'.encode())
+            
+            else: 
+                client_socket.sendall("Usuario sin sesión activa\n".encode())
+
+        else: 
+            client_socket.sendall("Opción no válida\n".encode())
+        
+    finally:
+        client_socket.close()
+
+
+def main():
+
+    create_user_table()
+
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.bind(('localhost', 3343))
+    server.listen(5)
+
+    while True:
+        client_socket, client_address = server.accept()
+        print(f"Cliente conectado: {client_address}")
+        thread = threading.Thread(target=handle_server, args=(client_socket,))
+        thread.daemon = True
+        thread.start()
+
+if __name__ == "__main__":
+    main()
+
