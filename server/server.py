@@ -1,216 +1,174 @@
 import socket
-import psycopg2
+import sqlite3
 import bcrypt
-import os
 import hmac
 import hashlib
-import base64
-from datetime import datetime, timedelta
+import time
+import os
 
+# --- CONFIGURACIÓN ---
+HOST = "127.0.0.1"
+PORT = 3030
+DB_FILE = "banco_seguro.db"
 
-MAX_ATTEMPTS = 5
-LOCK_TIME = timedelta(minutes=5)
+# CLAVE SECRETA (Debe ser larga y compleja para evitar ataques de fuerza bruta a la clave)
+# En un entorno real, esto estaría en variables de entorno.
+HMAC_SECRET_KEY = b'esta_es_una_clave_muy_segura_y_larga_para_evitar_bruteforce_2026'
 
-# Diccionario en memoria para controlar bloqueos: {username: {"attempts": int, "locked_until": datetime}}
-locked_users = {}
-failed_attempts = {}
-active_sessions = {}
-locked_nonces = set()  # Para evitar reutilización de nonces
+# MEMORIA VOLÁTIL PARA SEGURIDAD
+# Almacena los Nonces usados para evitar ataques de Replay
+nonces_vistos = set()
 
-# Clave secreta para HMAC (en un sistema real debería venir de una variable de entorno)
-HMAC_SECRET_KEY = b'secret_key_for_hmac'  # Cambia esto por una clave segura en producción
+# Control de Fuerza Bruta (IP o Usuario)
+intentos_fallidos = {}
 
-DB_CONFIG = {
-    "dbname": "insegus",
-    "user": "st09",
-    "password": "paulaylucia",
-    "host": "localhost",
-    "port": "5432"
-}
+def conectar_db():
+    return sqlite3.connect(DB_FILE)
 
-def generate_nonce(length = 16):
-    """Genera un nonce aleatorio codificado en base64 URL-safe"""
-    random_bytes = os.urandom(length)
-    return base64.urlsafe_b64encode(random_bytes).decode("utf-8")
-
-def generate_hmac(data, nonce, secret_key=HMAC_SECRET_KEY):
-    """Genera un HMAC-SHA256 sobre (nonce || data)"""
-    message = f"{nonce}:{data}".encode("utf-8")
-    mac = hmac.new(secret_key, message, hashlib.sha256)
-    return mac.hexdigest()
-
-def verify_hmac(data, nonce, mac_hex):
-    """Verifica que el HMAC recibido coincide con el calculado"""
-    expected = generate_hmac(data, nonce)
-    return hmac.compare_digest(expected, mac_hex)
-
-def conectardb(): 
-    try:
-        con = psycopg2.connect(**DB_CONFIG)
-        print("Conectado a la base de datos")
-        return con, con.cursor()
-    except Exception as e:
-        print(f"Error al conectar a la base de datos: {e}")
-        return None, None
-
-def hash_password(password):
-    salt = bcrypt.gensalt()
-    return bcrypt.hashpw(password.encode("utf-8"), salt)
-
-def create_user_table():
-    con, cursor = conectardb()
-    if not con or not cursor:
-        return
-    cursor.execute('''
+def inicializar_db():
+    """Cumple el requisito de Persistencia y Usuarios Preexistentes."""
+    con = conectar_db()
+    cur = con.cursor()
+    
+    # Tabla de Usuarios
+    cur.execute('''
         CREATE TABLE IF NOT EXISTS users (
-            id SERIAL PRIMARY KEY,
-            username VARCHAR(50) UNIQUE NOT NULL,
-            password VARCHAR(255) NOT NULL)
-        ''')
-    con.commit()
-    cursor.close()
-    con.close()
-
-def register_user(username, password_hash):
-    try:
-        con, cursor = conectardb()
-        if not con or not cursor:
-            return
-        cursor.execute("INSERT INTO users (username, password) VALUES (%s, %s)",
-                        (username, password_hash.decode('utf-8')))
-        con.commit()
-        return True
-    except psycopg2.IntegrityError:
-        return False
-    finally:
-        if cursor:
-            cursor.close()
-        if con:
-            con.close()
-
-def verify_user(username, password):
-    """Verifica las credenciales de un usuario contra la BD y gestiona bloqueos"""
-    global locked_users, failed_attempts
-    now = datetime.now()
-
-    if username in locked_users:
-        if now < locked_users[username]:
-            # Usuario bloqueado: incrementar intentos fallidos
-            return "Usuario bloqueado temporalmente"
-        else: del locked_users[username]
-
-    con, cursor = conectardb()
-    if not con or not cursor:
-        return False
-
-    try:
-        cursor.execute("SELECT password FROM users WHERE username = %s", (username,))
-        user = cursor.fetchone()
-
-        if not user:
-            return "Acceso denegado: Credenciales incorrectas"
-
-        stored_hash = user[0]
-
-        if isinstance(stored_hash, memoryview):
-            stored_hash = stored_hash.tobytes().decode("utf-8")
-
-        if not bcrypt.checkpw(password.encode("utf-8"), stored_hash):
-            failed_attempts[username] = failed_attempts.get(username, 0) + 1
-            if failed_attempts[username] >= MAX_ATTEMPTS:
-                # Bloquear usuario
-                locked_users[username] = {
-                    "locked_until": now + LOCK_TIME
-                }
-                return(f"Usuario '{username}' bloqueado por demasiados intentos fallidos")
-            return "Acceso denegado: Bloqueado temporalmente"
-        failed_attempts.pop(username, None)
-        return "Acceso concedido"
-    finally:
-        if cursor:
-            cursor.close()
-        if con:
-            con.close()
-
-
-def handle_server(client_socket):
-    try:
-        client_socket.sendall("Seleccione una opción:\n".encode())
-        client_socket.sendall("1. Registrarse\n".encode())
-        client_socket.sendall("2. Verificar credenciales\n".encode())
-        client_socket.sendall("3. Cerrar conexión\n".encode())
-        client_socket.sendall("Iniciar Transacción: ".encode())
-        option = client_socket.recv(1024).decode().strip()
-
-        
-        if option == "1":
-            client_socket.sendall("Ingrese nombre de usuario: ".encode())
-            username = client_socket.recv(1024).decode().strip()
-            client_socket.sendall("Ingrese contraseña: ".encode())
-            password = client_socket.recv(1024).decode().strip()
-            password_hash = hash_password(password)
-
-            if register_user(username, password_hash):
-                client_socket.sendall("Usuario registrado exitosamente\n".encode())
-            else:
-                client_socket.sendall("Error: El nombre de usuario ya existe\n".encode())
-        
-        if option == "2":
-            client_socket.sendall("Ingrese nombre de usuario: ".encode())
-            username = client_socket.recv(1024).decode().strip()
-            client_socket.sendall("Ingrese contraseña: ".encode())
-            password = client_socket.recv(1024).decode().strip()
-            password_hash = hash_password(password)
-
-            result = verify_user(username, password)
-            if result == "Acceso concedido":
-                active_sessions[username] = client_socket
-
-                nonce = generate_nonce()
-                locked_nonces.add(nonce)
-
-                hmac = generate_hmac(result,nonce)
-                client_socket.sendall(f'{result}\nNonce: {nonce}\nHMAC: {hmac}\n'.encode())
- 
-        if option == "4":
-            client_socket.sendall("Ingrese nombre de usuario: ".encode())
-            username = client_socket.recv(1024).decode().strip()
-
-            if username not in active_sessions:
-                client_socket.sendall("Introduzca la transacción:\n".encode())
-                transaction = client_socket.recv(1024).decode().strip()
-
-                nonce = generate_nonce()
-                locked_nonces.add(nonce)
-
-                hmac = generate_hmac(transaction, nonce)
-                client_socket.sendall(f'Transacción finalizada\nNonce: {nonce}\nHMAC: {hmac}\n'.encode())
+            username TEXT PRIMARY KEY,
+            password TEXT NOT NULL
+        )
+    ''')
+    
+    # Crear usuarios preexistentes si no existen (Requisito 5)
+    usuarios_base = [("admin", "admin123"), ("usuario1", "user123")]
+    for user, pwd in usuarios_base:
+        try:
+            salt = bcrypt.gensalt()
+            pw_hash = bcrypt.hashpw(pwd.encode(), salt).decode('utf-8')
+            cur.execute("INSERT INTO users (username, password) VALUES (?, ?)", (user, pw_hash))
+        except sqlite3.IntegrityError:
+            pass # Ya existen
             
-            else: 
-                client_socket.sendall("Usuario sin sesión activa\n".encode())
+    con.commit()
+    con.close()
+    print(f"--- BASE DE DATOS '{DB_FILE}' INICIALIZADA ---")
 
-        else: 
-            client_socket.sendall("Opción no válida\n".encode())
+def verificar_seguridad(datos_raw):
+    """
+    Verifica Integridad (MAC) y Anti-Replay (Nonce).
+    Formato esperado: NONCE|COMANDO|ARGUMENTOS|MAC
+    """
+    try:
+        partes = datos_raw.split("|")
+        # El MAC siempre es el último elemento
+        nonce = partes[0]
+        mac_recibido = partes[-1]
         
+        # Reconstruir el mensaje sin el MAC para calcularlo nosotros
+        # El mensaje que se firmó fue: NONCE + COMANDO + ARGUMENTOS
+        datos_para_firmar = "|".join(partes[:-1]) 
+        
+        # 1. VERIFICAR REPLAY (Requisito Seguridad)
+        if nonce in nonces_vistos:
+            return False, "ATAQUE REPLAY DETECTADO: Nonce reutilizado."
+        
+        # 2. VERIFICAR INTEGRIDAD (MAC)
+        mac_calculado = hmac.new(HMAC_SECRET_KEY, datos_para_firmar.encode(), hashlib.sha256).hexdigest()
+        
+        # Usamos compare_digest para evitar ataques de canal lateral (Timing Attacks)
+        if not hmac.compare_digest(mac_calculado, mac_recibido):
+            return False, "FALLO INTEGRIDAD: La firma MAC no coincide."
+            
+        # Si todo es correcto, guardamos el Nonce y devolvemos los datos limpios
+        nonces_vistos.add(nonce)
+        # Devolvemos el comando y los argumentos (quitamos nonce y mac)
+        return True, partes[1:-1] 
+        
+    except Exception as e:
+        return False, f"Error de protocolo: {e}"
+
+def procesar_comando(comando, args):
+    """Lógica de negocio del Banco."""
+    con = conectar_db()
+    cur = con.cursor()
+    
+    try:
+        if comando == "REGISTER":
+            # Args: Usuario, Password
+            if len(args) != 2: return "ERROR: Datos incorrectos"
+            user, pwd = args[0], args[1]
+            
+            salt = bcrypt.gensalt()
+            pw_hash = bcrypt.hashpw(pwd.encode(), salt).decode('utf-8')
+            
+            try:
+                cur.execute("INSERT INTO users (username, password) VALUES (?, ?)", (user, pw_hash))
+                con.commit()
+                return "OK: Usuario registrado exitosamente."
+            except sqlite3.IntegrityError:
+                return "ERROR: El usuario ya existe."
+                
+        elif comando == "LOGIN":
+            # Args: Usuario, Password
+            if len(args) != 2: return "ERROR: Datos incorrectos"
+            user, pwd = args[0], args[1]
+            
+            cur.execute("SELECT password FROM users WHERE username = ?", (user,))
+            row = cur.fetchone()
+            
+            if row and bcrypt.checkpw(pwd.encode(), row[0].encode()):
+                return "OK: Inicio de sesion exitoso."
+            else:
+                # Protección contra fuerza bruta (Retardo)
+                time.sleep(2) 
+                return "ERROR: Credenciales invalidas."
+                
+        elif comando == "TRANSFER":
+            # Args: Origen, Destino, Cantidad
+            # Requisito 6: No validar cuentas, solo formato.
+            if len(args) != 3: return "ERROR: Formato de transaccion incorrecto"
+            origen, destino, cantidad = args[0], args[1], args[2]
+            
+            # Aquí solo confirmamos integridad, no saldo real (según el enunciado)
+            return f"OK: Transferencia de {cantidad} de {origen} a {destino} realizada con integridad."
+            
+        else:
+            return "ERROR: Comando desconocido."
+            
     finally:
-        client_socket.close()
+        con.close()
 
-
-def main():
-
-    create_user_table()
-
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.bind(('localhost', 3343))
-    server.listen(5)
-
-    while True:
-        client_socket, client_address = server.accept()
-        print(f"Cliente conectado: {client_address}")
-        thread = threading.Thread(target=handle_server, args=(client_socket,))
-        thread.daemon = True
-        thread.start()
-
+# --- BUCLE PRINCIPAL ---
 if __name__ == "__main__":
-    main()
-
+    inicializar_db()
+    
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind((HOST, PORT))
+        s.listen()
+        print(f"--- SERVIDOR BANCO SEGURO ESCUCHANDO EN {PORT} ---")
+        
+        while True:
+            conn, addr = s.accept()
+            with conn:
+                print(f"Conexión: {addr}")
+                while True:
+                    data = conn.recv(4096).decode()
+                    if not data: break
+                    
+                    # 1. VERIFICAR SEGURIDAD
+                    es_seguro, resultado = verificar_seguridad(data)
+                    
+                    if not es_seguro:
+                        print(f"ALERTA SEGURIDAD: {resultado}")
+                        conn.sendall(f"ERROR_SEGURIDAD: {resultado}".encode())
+                    else:
+                        # 2. PROCESAR SI ES SEGURO
+                        # resultado es una lista: [COMANDO, ARG1, ARG2...]
+                        if not resultado: continue # Lista vacia
+                        
+                        cmd = resultado[0]
+                        argumentos = resultado[1:]
+                        
+                        print(f"Procesando comando seguro: {cmd}")
+                        respuesta = procesar_comando(cmd, argumentos)
+                        conn.sendall(respuesta.encode())
