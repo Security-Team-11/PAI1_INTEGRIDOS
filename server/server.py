@@ -90,6 +90,8 @@ def procesar_comando(comando, args):
             if len(args) != 2:
                 return "ERROR: Datos incorrectos"
             user, pwd = args[0], args[1]
+            if not (8 <= len(pwd) <= 16):
+                return "ERROR: La contraseña debe tener entre 8 y 16 caracteres."
 
             salt = bcrypt.gensalt()
             pw_hash = bcrypt.hashpw(pwd.encode(), salt).decode("utf-8")

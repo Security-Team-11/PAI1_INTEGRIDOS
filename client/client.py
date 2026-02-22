@@ -33,7 +33,6 @@ def enviar_comando_seguro(sock, comando, *args):
     
     sock.sendall(mensaje_final.encode())
     respuesta = sock.recv(4096).decode()
-    print("DEBUG SENT:", mensaje_final)
     return respuesta
 
 # --- INTERFAZ DE USUARIO ---
@@ -67,13 +66,23 @@ if __name__ == "__main__":
             
             if opcion == "1": # REGISTER
                 u = input("Nuevo Usuario: ")
-                p = getpass.getpass("Contraseña: ")
+                while True:
+                    p = getpass.getpass("Contraseña (8-16 caracteres): ")
+                    if 8 <= len(p) <= 16:
+                        break
+                    else:
+                        print("Error: La contraseña debe tener entre 8 y 16 caracteres.")
                 resp = enviar_comando_seguro(s, "REGISTER", u, p)
                 print(f"\nSERVIDOR: {resp}")
                 
             elif opcion == "2": # LOGIN
                 u = input("Usuario: ")
-                p = getpass.getpass("Contraseña: ")
+                while True:
+                    p = getpass.getpass("Contraseña (8-16 caracteres): ")
+                    if 8 <= len(p) <= 16:
+                        break
+                    else:
+                        print("Error: La contraseña debe tener entre 8 y 16 caracteres.")
                 resp = enviar_comando_seguro(s, "LOGIN", u, p)
                 print(f"\nSERVIDOR: {resp}")
                 if "OK" in resp:
