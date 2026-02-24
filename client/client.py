@@ -6,7 +6,7 @@ import sys
 import getpass
 
 HOST = "127.0.0.1"
-PORT = 3030
+PORT = 3031
 HMAC_SECRET_KEY = b'esta_es_una_clave_muy_segura_y_larga_para_evitar_bruteforce_2026'
 
 def generar_nonce():
